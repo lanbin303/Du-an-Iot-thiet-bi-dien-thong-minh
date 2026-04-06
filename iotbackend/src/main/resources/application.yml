@@ -1,0 +1,20 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/IoT
+    username: postgres
+    password: secret
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+
+mqtt:
+  broker: tcp://localhost:1883
+  client-id: spring-backend
+
+jwt:
+  secret: your-super-secret-key-change-this-in-production-min-32-chars
+  expiration: 86400000
