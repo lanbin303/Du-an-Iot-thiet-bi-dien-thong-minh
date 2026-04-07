@@ -36,4 +36,4 @@ Thumbs.db
 
 # Environment
 .env
-lib/config/api_config.dart
+git add TinyUI/nguyentrinhlan/lib/config/api_config.dart
