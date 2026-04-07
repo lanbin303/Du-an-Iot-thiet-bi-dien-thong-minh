@@ -12,7 +12,7 @@ spring:
     show-sql: true
 
 mqtt:
-  broker: tcp://localhost:1884
+  broker: tcp://broker.hivemq.com:1883
   client-id: spring-backend
 
 jwt:

@@ -8,14 +8,16 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "mqtt_client.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
+#include "wifi_provisioning/manager.h"
+#include "wifi_provisioning/scheme_softap.h"
+#include "qrcode.h"
 
 // ========== CẤU HÌNH ==========
-#define WIFI_SSID        "Lockdown"
-#define WIFI_PASS        "phuc12345"
-#define MQTT_BROKER_URI  "mqtt://192.168.1.42:1884"
+#define MQTT_BROKER_URI  "mqtt://broker.hivemq.com:1883"
 #define DEVICE_ID        "ESP32-001"
 
 #define RELAY_PIN        21
@@ -31,6 +33,12 @@
 #define PZEM_ADDR        0xF8
 
 #define TELEMETRY_INTERVAL_MS  5000
+
+// Provisioning
+#define PROV_QR_VERSION      "v1"
+#define PROV_TRANSPORT       "softap"
+#define PROV_POP             "abcd1234"
+#define QRCODE_BASE_URL      "https://espressif.github.io/esp-jumpstart/qrcode.html"
 // ==============================
 
 #define TOPIC_CONTROL    "device/" DEVICE_ID "/control"
@@ -70,7 +78,6 @@ typedef struct {
 // ========== ĐỌC PZEM ==========
 static pzem_data_t pzem_read(void) {
     pzem_data_t result = {0};
-
     uint8_t cmd[8] = {
         PZEM_ADDR, 0x04,
         0x00, 0x00,
@@ -87,7 +94,6 @@ static pzem_data_t pzem_read(void) {
     uint8_t buf[25] = {0};
     int len = uart_read_bytes(PZEM_UART_NUM, buf, sizeof(buf),
                               pdMS_TO_TICKS(500));
-
     if (len < 25) {
         ESP_LOGW(TAG, "PZEM timeout! Nhan %d bytes", len);
         return result;
@@ -114,7 +120,6 @@ static pzem_data_t pzem_read(void) {
     ESP_LOGI(TAG, "PZEM: %.1fV | %.3fA | %.1fW | %.0fWh | %.1fHz | PF:%.2f",
              result.voltage, result.current, result.power,
              result.energy, result.frequency, result.power_factor);
-
     return result;
 }
 
@@ -129,7 +134,7 @@ static void pzem_init(void) {
     };
     ESP_ERROR_CHECK(uart_param_config(PZEM_UART_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(PZEM_UART_NUM,
-                                  PZEM_RX_PIN, PZEM_TX_PIN, // ← đổi RX TX
+                                  PZEM_RX_PIN, PZEM_TX_PIN,
                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_ERROR_CHECK(uart_driver_install(PZEM_UART_NUM, 256, 0, 0, NULL, 0));
     ESP_LOGI(TAG, "PZEM: RX=GPIO%d TX=GPIO%d", PZEM_RX_PIN, PZEM_TX_PIN);
@@ -139,8 +144,7 @@ static void pzem_init(void) {
 static void set_relay(bool on) {
     relay_state = on;
     gpio_set_level(RELAY_PIN, on ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL);
-    ESP_LOGI(TAG, "Relay: %s (level:%d)", on ? "ON" : "OFF",
-             on ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL);
+    ESP_LOGI(TAG, "Relay: %s", on ? "ON" : "OFF");
 
     if (mqtt_client) {
         char payload[48];
@@ -150,25 +154,21 @@ static void set_relay(bool on) {
     }
 }
 
-// ========== TASK BUTTON (Polling) ==========
+// ========== TASK BUTTON ==========
 static void button_task(void *arg) {
     int last_state = gpio_get_level(BUTTON_PIN);
-
     while (1) {
         int current_state = gpio_get_level(BUTTON_PIN);
-
         if (current_state != last_state) {
-            vTaskDelay(pdMS_TO_TICKS(50)); // debounce
+            vTaskDelay(pdMS_TO_TICKS(50));
             current_state = gpio_get_level(BUTTON_PIN);
-
             if (current_state != last_state) {
-                // Toggle relay khi công tắc thay đổi vị trí (cả 2 chiều)
-                ESP_LOGI(TAG, "Cong tac doi vi tri: %s -> %s",
+                ESP_LOGI(TAG, "Cong tac: %s -> %s",
                          relay_state ? "ON" : "OFF",
                          relay_state ? "OFF" : "ON");
                 set_relay(!relay_state);
                 last_state = current_state;
-                vTaskDelay(pdMS_TO_TICKS(300)); // chống bounce
+                vTaskDelay(pdMS_TO_TICKS(300));
             }
         }
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -179,7 +179,6 @@ static void button_task(void *arg) {
 static void telemetry_task(void *arg) {
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(TELEMETRY_INTERVAL_MS));
-
         if (!mqtt_client) continue;
 
         pzem_data_t data = pzem_read();
@@ -188,12 +187,9 @@ static void telemetry_task(void *arg) {
         if (data.valid) {
             snprintf(payload, sizeof(payload),
                 "{\"device_id\":\"%s\","
-                "\"voltage\":%.1f,"
-                "\"current\":%.3f,"
-                "\"power\":%.1f,"
-                "\"energy\":%.0f,"
-                "\"frequency\":%.1f,"
-                "\"power_factor\":%.2f,"
+                "\"voltage\":%.1f,\"current\":%.3f,"
+                "\"power\":%.1f,\"energy\":%.0f,"
+                "\"frequency\":%.1f,\"power_factor\":%.2f,"
                 "\"status\":\"%s\"}",
                 DEVICE_ID,
                 data.voltage, data.current, data.power,
@@ -210,19 +206,68 @@ static void telemetry_task(void *arg) {
 
         esp_mqtt_client_publish(mqtt_client, TOPIC_TELEMETRY,
                                 payload, 0, 1, 0);
-        ESP_LOGI(TAG, "Telemetry: %s", payload);
     }
 }
 
-// ========== WIFI EVENT HANDLER ==========
-static void wifi_event_handler(void *arg, esp_event_base_t base,
-                                int32_t event_id, void *data) {
-    if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)data;
-        ESP_LOGW(TAG, "WiFi mat ket noi! Reason: %d", disc->reason);
-        esp_wifi_connect(); // Xóa vTaskDelay - không dùng delay trong event handler
+// ========== IN QR CODE ==========
+static void print_qr_code(const char *service_name) {
+    char payload[200] = {0};
+    snprintf(payload, sizeof(payload),
+             "{\"ver\":\"%s\",\"name\":\"%s\","
+             "\"pop\":\"%s\",\"transport\":\"%s\"}",
+             PROV_QR_VERSION, service_name,
+             PROV_POP, PROV_TRANSPORT);
+
+    ESP_LOGI(TAG, "=== QUET MA QR DE CAU HINH WIFI ===");
+    ESP_LOGI(TAG, "Ten WiFi AP: %s", service_name);
+    ESP_LOGI(TAG, "PIN: %s", PROV_POP);
+    ESP_LOGI(TAG, "URL: %s?data=%s", QRCODE_BASE_URL, payload);
+
+    esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
+    esp_qrcode_generate(&cfg, payload);
+
+    ESP_LOGI(TAG, "====================================");
+}
+
+// ========== EVENT HANDLER ==========
+static void event_handler(void *arg, esp_event_base_t base,
+                           int32_t event_id, void *data) {
+    if (base == WIFI_PROV_EVENT) {
+        switch (event_id) {
+        case WIFI_PROV_START:
+            ESP_LOGI(TAG, "Provisioning bat dau...");
+            break;
+        case WIFI_PROV_CRED_RECV: {
+            wifi_sta_config_t *cfg = (wifi_sta_config_t *)data;
+            ESP_LOGI(TAG, "Nhan WiFi: SSID=%s", (char *)cfg->ssid);
+            break;
+        }
+        case WIFI_PROV_CRED_FAIL: {
+            wifi_prov_sta_fail_reason_t *reason = (wifi_prov_sta_fail_reason_t *)data;
+            ESP_LOGE(TAG, "Provisioning that bai: %s",
+                     (*reason == WIFI_PROV_STA_AUTH_ERROR) ?
+                     "Sai mat khau WiFi" : "Khong tim thay WiFi");
+            wifi_prov_mgr_reset_sm_state_on_failure();
+            break;
+        }
+        case WIFI_PROV_CRED_SUCCESS:
+            ESP_LOGI(TAG, "Provisioning thanh cong!");
+            break;
+        case WIFI_PROV_END:
+            wifi_prov_mgr_deinit();
+            break;
+        default:
+            break;
+        }
+    } else if (base == WIFI_EVENT) {
+        if (event_id == WIFI_EVENT_STA_START) {
+            esp_wifi_connect();
+        } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+            wifi_event_sta_disconnected_t *disc =
+                (wifi_event_sta_disconnected_t *)data;
+            ESP_LOGW(TAG, "WiFi mat ket noi! Reason: %d", disc->reason);
+            esp_wifi_connect();
+        }
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "WiFi OK! IP: " IPSTR, IP2STR(&event->ip_info.ip));
@@ -230,69 +275,87 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     }
 }
 
-// ========== KHỞI TẠO WIFI ==========
-static void wifi_init(void) {
+// ========== KHỞI TẠO WIFI + PROVISIONING ==========
+static void wifi_init_provisioning(void) {
     wifi_event_group = xEventGroupCreate();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap(); // Cần cho SoftAP provisioning
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    // ← THÊM 2 DÒNG NÀY
+    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
 
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID,
-        &wifi_event_handler, NULL, &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP,
-        &wifi_event_handler, NULL, &instance_got_ip));
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-            .threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK,
-            .pmf_cfg = {
-                .capable = true,
-                .required = false,
-            },
-        },
+    // Dùng SoftAP scheme
+    wifi_prov_mgr_config_t prov_config = {
+        .scheme = wifi_prov_scheme_softap,
+        .scheme_event_handler = WIFI_PROV_EVENT_HANDLER_NONE,
     };
+    ESP_ERROR_CHECK(wifi_prov_mgr_init(prov_config));
+    bool provisioned = false;
+    ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    if (!provisioned) {
+        ESP_LOGI(TAG, "Chua co WiFi - Bat dau Provisioning qua SoftAP...");
 
-    ESP_LOGI(TAG, "Dang ket noi WiFi: %s...", WIFI_SSID);
+        // Tạo tên AP từ MAC
+        char service_name[16];
+        uint8_t mac[6];
+        esp_wifi_get_mac(WIFI_IF_STA, mac);
+        snprintf(service_name, sizeof(service_name),
+                 "PROV_%02X%02X%02X", mac[3], mac[4], mac[5]);
+
+        wifi_prov_security_t security = WIFI_PROV_SECURITY_1;
+        const char *pop = PROV_POP;
+
+        ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(
+            security, pop, service_name, NULL));
+
+        // In QR ra Serial Monitor
+        print_qr_code(service_name);
+
+        ESP_LOGI(TAG, "Ket noi WiFi vao: %s", service_name);
+        ESP_LOGI(TAG, "Sau do dung app nhap PIN: %s", PROV_POP);
+
+    } else {
+        ESP_LOGI(TAG, "Da co WiFi - Ket noi truc tiep...");
+        wifi_prov_mgr_deinit();
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_start());
+    }
+
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT,
                         false, true, portMAX_DELAY);
+    ESP_LOGI(TAG, "WiFi ket noi thanh cong!");
 }
 
 // ========== MQTT EVENT HANDLER ==========
 static void mqtt_event_handler(void *arg, esp_event_base_t base,
                                 int32_t event_id, void *data) {
     esp_mqtt_event_handle_t event = data;
-
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT ket noi thanh cong!");
         esp_mqtt_client_subscribe(mqtt_client, TOPIC_CONTROL, 1);
         set_relay(relay_state);
         break;
-
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "MQTT mat ket noi!");
         break;
-
     case MQTT_EVENT_DATA: {
         char payload[64] = {0};
         strncpy(payload, event->data,
                 event->data_len < 63 ? event->data_len : 63);
         ESP_LOGI(TAG, "MQTT nhan: %s", payload);
-
         if (strstr(payload, "\"ON\"") || strcmp(payload, "ON") == 0) {
             set_relay(true);
         } else if (strstr(payload, "\"OFF\"") || strcmp(payload, "OFF") == 0) {
@@ -300,11 +363,9 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         }
         break;
     }
-
     case MQTT_EVENT_ERROR:
         ESP_LOGE(TAG, "MQTT loi!");
         break;
-
     default:
         break;
     }
@@ -317,11 +378,11 @@ static void mqtt_init(void) {
         .credentials.client_id = DEVICE_ID,
         .network.reconnect_timeout_ms = 5000,
     };
-
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID,
                                    mqtt_event_handler, NULL);
     esp_mqtt_client_start(mqtt_client);
+    ESP_LOGI(TAG, "MQTT: %s", MQTT_BROKER_URI);
 }
 
 // ========== APP MAIN ==========
@@ -337,23 +398,23 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // 2. PZEM UART
+    // 2. PZEM
     pzem_init();
 
-    // 3. Relay - chống xung rác khi khởi động
+    // 3. Relay
     gpio_reset_pin(RELAY_PIN);
     gpio_set_level(RELAY_PIN, RELAY_OFF_LEVEL);
     gpio_set_direction(RELAY_PIN, GPIO_MODE_OUTPUT);
     ESP_LOGI(TAG, "Relay GPIO%d = OFF", RELAY_PIN);
 
-    // 4. Button Polling
+    // 4. Button
     gpio_reset_pin(BUTTON_PIN);
     gpio_set_direction(BUTTON_PIN, GPIO_MODE_INPUT);
     gpio_set_pull_mode(BUTTON_PIN, GPIO_PULLUP_ONLY);
     ESP_LOGI(TAG, "Button GPIO%d OK", BUTTON_PIN);
-
-    // 5. WiFi
-    wifi_init();
+    wifi_prov_mgr_reset_provisioning();
+    // 5. WiFi + Provisioning
+    wifi_init_provisioning();
 
     // 6. MQTT
     mqtt_init();
@@ -362,7 +423,7 @@ void app_main(void) {
     xTaskCreate(button_task,    "button",    4096, NULL, 5, NULL);
     xTaskCreate(telemetry_task, "telemetry", 4096, NULL, 5, NULL);
 
-    ESP_LOGI(TAG, "=== San sang! ===");
-    ESP_LOGI(TAG, "Relay:GPIO%d | Button:GPIO%d | PZEM:RX=%d TX=%d",
-             RELAY_PIN, BUTTON_PIN, PZEM_RX_PIN, PZEM_TX_PIN);
+    ESP_LOGI(TAG, "=== He thong san sang! ===");
+    ESP_LOGI(TAG, "Device: %s | Relay:GPIO%d | Button:GPIO%d",
+             DEVICE_ID, RELAY_PIN, BUTTON_PIN);
 }
